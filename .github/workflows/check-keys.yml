@@ -1,0 +1,50 @@
+name: Check keys in Telegram forum
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: check-tg-keys
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install telethon "requests[socks]"
+
+      - name: Install Xray
+        run: |
+          curl -fsSL -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          sudo unzip -o xray.zip xray -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/xray
+
+      - name: Restore dead keys cache
+        uses: actions/cache@v4
+        with:
+          path: cache/dead_keys.json
+          key: dead-keys-${{ github.run_id }}
+          restore-keys: |
+            dead-keys-
+
+      - name: Check and clean forum
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TG_CHAT: "-1001234567890"   # id или @username форума
+          TG_TOPIC_ID: "123"          # id топика с ключами (или убери строку)
+          MSG_LIMIT: "2000"
+          DEAD_TTL_DAYS: "7"
+          DRY_RUN: "0"                # поставь "1" для пробного прогона без удаления
+        run: python scripts/tg_clean.py
