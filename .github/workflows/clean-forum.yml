@@ -1,50 +1,12 @@
-name: Clean forum keys
-
-on:
-  schedule:
-    - cron: "0 */6 * * *"
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Только показать, что удалится"
-        type: boolean
-        default: true
-
-permissions:
-  contents: read
-
-concurrency:
-  group: clean-forum
-  cancel-in-progress: false
-
-jobs:
-  clean:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install deps
-        run: pip install telethon "requests[socks]"
-
-      - name: Install Xray
-        run: |
-          curl -fsSL -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          sudo unzip -o xray.zip xray -d /usr/local/bin
-          sudo chmod +x /usr/local/bin/xray
-          xray version
-
       - name: Install sing-box
         run: |
           # Получаем прямую ссылку на скачивание архива для linux-amd64 из релизов API
           DOWNLOAD_URL=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
-            https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-
-            | grep -o '"browser_download_url": "[^"]*' | grep 'linux-amd64' | head -n 1 | cut -d'"' -f4)
+            https://github.com \
+            | grep -o '"browser_download_url": "[^"]*' \
+            | grep 'linux-amd64' \
+            | head -n 1 \
+            | cut -d'"' -f4)
           
           if [ -z "$DOWNLOAD_URL" ]; then
             echo "Ошибка: не удалось найти ссылку для linux-amd64"
