@@ -50,18 +50,33 @@ jobs:
       - name: Install sing-box
         run: |
           set -euo pipefail
-          VER=$(curl --fail --silent --show-error \
-                     -H "Authorization: Bearer ${{ github.token }}" \
-                     https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-                    | grep -m1 '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+          # ВАЖНО: качаем ответ API в файл, а НЕ в пайплайн.
+          # Раньше было `curl | grep -m1`: grep закрывал пайп раньше,
+          # чем curl докачивал ответ -> обрыв записи -> ошибка 23.
+          curl --fail --silent --show-error --location \
+               --retry 3 --retry-delay 2 --retry-all-errors \
+               -H "Authorization: Bearer ${{ github.token }}" \
+               -H "Accept: application/vnd.github+json" \
+               -o /tmp/sb_latest.json \
+               "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+
+          TAG=$(jq -r '.tag_name' /tmp/sb_latest.json)
+          VER="${TAG#v}"
+
+          if [[ -z "$VER" || "$VER" == "null" ]]; then
+            echo "Не удалось определить версию sing-box. Ответ API:" >&2
+            cat /tmp/sb_latest.json >&2
+            exit 1
+          fi
           echo "sing-box version: ${VER}"
+
           curl --fail --silent --show-error --location \
                --retry 3 --retry-delay 2 --retry-all-errors \
                -o /tmp/sb.tar.gz \
                "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
           tar -xzf /tmp/sb.tar.gz -C /tmp
           sudo install -m 755 "/tmp/sing-box-${VER}-linux-amd64/sing-box" /usr/local/bin/sing-box
-          rm -rf "/tmp/sb.tar.gz" "/tmp/sing-box-${VER}-linux-amd64"
+          rm -rf /tmp/sb.tar.gz "/tmp/sing-box-${VER}-linux-amd64" /tmp/sb_latest.json
           sing-box version
 
       - name: Restore dead keys cache
