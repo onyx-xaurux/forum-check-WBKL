@@ -19,9 +19,6 @@ concurrency:
 
 jobs:
   clean:
-    # ubuntu-latest с 19.10.2026 постепенно мигрирует на Ubuntu 26.04.
-    # Фиксируем образ, чтобы планировщик не "поехал" в неподходящий момент.
-    # (ubuntu-22.04 уже выведен из эксплуатации — не используйте его.)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -41,21 +38,32 @@ jobs:
       - name: Install Xray
         run: |
           set -euo pipefail
-          curl -fsSL -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          sudo unzip -o xray.zip xray -d /usr/local/bin
+          # Скачиваем в /tmp, чтобы не зависеть от прав $GITHUB_WORKSPACE,
+          # и используем --retry на случай transient-ошибок GitHub CDN.
+          curl --fail --silent --show-error --location \
+               --retry 3 --retry-delay 2 --retry-all-errors \
+               -o /tmp/xray.zip \
+               "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+          sudo unzip -o /tmp/xray.zip xray -d /usr/local/bin
           sudo chmod +x /usr/local/bin/xray
+          rm -f /tmp/xray.zip
           xray version
 
       - name: Install sing-box
         run: |
           set -euo pipefail
-          VER=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
-            https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-            | grep -m1 '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+          VER=$(curl --fail --silent --show-error \
+                     -H "Authorization: Bearer ${{ github.token }}" \
+                     https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+                    | grep -m1 '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
           echo "sing-box version: ${VER}"
-          curl -fsSL -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
-          tar -xzf sb.tar.gz
-          sudo install -m 755 "sing-box-${VER}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          curl --fail --silent --show-error --location \
+               --retry 3 --retry-delay 2 --retry-all-errors \
+               -o /tmp/sb.tar.gz \
+               "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          sudo install -m 755 "/tmp/sing-box-${VER}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          rm -rf "/tmp/sb.tar.gz" "/tmp/sing-box-${VER}-linux-amd64"
           sing-box version
 
       - name: Restore dead keys cache
@@ -76,5 +84,3 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           WORKERS: "20"
           TIMEOUT: "8"
-          DEAD_TTL_DAYS: "7"
-        run: python scripts/tg_forum_clean.py
