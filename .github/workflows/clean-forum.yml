@@ -40,12 +40,20 @@ jobs:
 
       - name: Install sing-box
         run: |
-          VER=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+          # Получаем прямую ссылку на скачивание архива для linux-amd64 из релизов API
+          DOWNLOAD_URL=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
             https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-            | grep -m1 '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
-          curl -fsSL -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
-          tar -xzf sb.tar.gz
-          sudo install -m 755 "sing-box-${VER}-linux-amd64/sing-box" /usr/local/bin/sing-box
+
+            | grep -o '"browser_download_url": "[^"]*' | grep 'linux-amd64' | head -n 1 | cut -d'"' -f4)
+          
+          if [ -z "$DOWNLOAD_URL" ]; then
+            echo "Ошибка: не удалось найти ссылку для linux-amd64"
+            exit 1
+          fi
+          
+          curl -fsSL -o sb.tar.gz "$DOWNLOAD_URL"
+          tar -xzf sb.tar.gz --strip-components=1
+          sudo install -m 755 sing-box /usr/local/bin/sing-box
           sing-box version
 
       - name: Restore dead keys cache
