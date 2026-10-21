@@ -38,8 +38,6 @@ jobs:
       - name: Install Xray
         run: |
           set -euo pipefail
-          # Скачиваем в /tmp, чтобы не зависеть от прав $GITHUB_WORKSPACE,
-          # и используем --retry на случай transient-ошибок GitHub CDN.
           curl --fail --silent --show-error --location \
                --retry 3 --retry-delay 2 --retry-all-errors \
                -o /tmp/xray.zip \
@@ -84,3 +82,5 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           WORKERS: "20"
           TIMEOUT: "8"
+          DEAD_TTL_DAYS: "7"
+        run: python scripts/tg_forum_clean.py
