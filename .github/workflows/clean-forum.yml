@@ -1,0 +1,70 @@
+name: Clean forum keys
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Только показать, что удалится"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clean-forum
+  cancel-in-progress: false
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install telethon "requests[socks]"
+
+      - name: Install Xray
+        run: |
+          curl -fsSL -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          sudo unzip -o xray.zip xray -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/xray
+          xray version
+
+      - name: Install sing-box
+        run: |
+          VER=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+            https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | grep -m1 '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+          curl -fsSL -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
+          tar -xzf sb.tar.gz
+          sudo install -m 755 "sing-box-${VER}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version
+
+      - name: Restore dead keys cache
+        uses: actions/cache@v4
+        with:
+          path: cache/dead_keys.json
+          key: dead-keys-${{ github.run_id }}
+          restore-keys: |
+            dead-keys-
+
+      - name: Check keys and delete dead messages
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          TG_TOPIC_ID: ${{ secrets.TG_TOPIC_ID }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          WORKERS: "20"
+          TIMEOUT: "8"
+          DEAD_TTL_DAYS: "7"
+        run: python scripts/tg_forum_clean.py
