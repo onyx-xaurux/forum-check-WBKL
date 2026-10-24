@@ -9,6 +9,14 @@ on:
         description: "Только показать, что удалится"
         type: boolean
         default: true
+      log_level:
+        description: "Уровень логов"
+        type: choice
+        options:
+          - DEBUG
+          - INFO
+          - WARNING
+        default: INFO
 
 permissions:
   contents: read
@@ -33,7 +41,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install telethon "requests[socks]"
+          pip install telethon "requests[socks]" psycopg2-binary
 
       - name: Install Xray
         run: |
@@ -50,9 +58,7 @@ jobs:
       - name: Install sing-box
         run: |
           set -euo pipefail
-          # ВАЖНО: качаем ответ API в файл, а НЕ в пайплайн.
-          # Раньше было `curl | grep -m1`: grep закрывал пайп раньше,
-          # чем curl докачивал ответ -> обрыв записи -> ошибка 23.
+          # Ответ API качаем в файл, а не в пайплайн (иначе curl падает с ошибкой 23)
           curl --fail --silent --show-error --location \
                --retry 3 --retry-delay 2 --retry-all-errors \
                -H "Authorization: Bearer ${{ github.token }}" \
@@ -79,14 +85,6 @@ jobs:
           rm -rf /tmp/sb.tar.gz "/tmp/sing-box-${VER}-linux-amd64" /tmp/sb_latest.json
           sing-box version
 
-      - name: Restore dead keys cache
-        uses: actions/cache@v6
-        with:
-          path: cache/dead_keys.json
-          key: dead-keys-${{ github.run_id }}
-          restore-keys: |
-            dead-keys-
-
       - name: Check keys and delete dead messages
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -94,8 +92,16 @@ jobs:
           TG_SESSION: ${{ secrets.TG_SESSION }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
           TG_TOPIC_ID: ${{ secrets.TG_TOPIC_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          LOG_LEVEL: ${{ github.event.inputs.log_level || 'INFO' }}
           WORKERS: "20"
           TIMEOUT: "8"
-          DEAD_TTL_DAYS: "7"
+          OK_INTERVAL_SEC: "3600"
+          BACKOFF_BASE_SEC: "3600"
+          BACKOFF_FACTOR: "2"
+          BACKOFF_MAX_SEC: "604800"
+          DELETE_AFTER_FAILS: "1"
+          STATE_TTL_DAYS: "0"
+          SAFEGUARD_MIN: "10"
         run: python scripts/tg_forum_clean.py
