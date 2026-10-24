@@ -1,202 +1,441 @@
+import base64
+import hashlib
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
+from urllib.parse import parse_qs, unquote, urlparse
 
-log = logging.getLogger("state")
+import requests
 
-STATE_FILE = os.getenv("STATE_FILE", "cache/keys_state.json")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-OK_INTERVAL_SEC = int(os.getenv("OK_INTERVAL_SEC", "3600"))          # через сколько снова проверять рабочий
-BACKOFF_BASE_SEC = int(os.getenv("BACKOFF_BASE_SEC", "3600"))        # первая задержка после неудачи
-BACKOFF_FACTOR = float(os.getenv("BACKOFF_FACTOR", "2"))             # во сколько раз растёт задержка
-BACKOFF_MAX_SEC = int(os.getenv("BACKOFF_MAX_SEC", str(7 * 86400)))  # потолок задержки
-SKIP_RECHECK_SEC = int(os.getenv("SKIP_RECHECK_SEC", "86400"))       # для неподдерживаемых форматов
-DELETE_AFTER_FAILS = int(os.getenv("DELETE_AFTER_FAILS", "1"))       # серия неудач для удаления
-STATE_TTL_DAYS = float(os.getenv("STATE_TTL_DAYS", "30"))            # 0 = не чистить
-SCHEMA_VERSION = 1
+log = logging.getLogger("check")
 
+XRAY_BIN = os.getenv("XRAY_BIN", "xray")
+SB_BIN = os.getenv("SB_BIN", "sing-box")
+TEST_URL = os.getenv("TEST_URL", "http://cp.cloudflare.com/generate_204")
+WORKERS = int(os.getenv("WORKERS", "20"))
+TIMEOUT = int(os.getenv("TIMEOUT", "8"))
+BASE_PORT = 20000
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(dt):
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if dt else None
+XRAY_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
+SB_SCHEMES = ("hysteria2://", "hy2://", "hysteria://", "anytls://")
+SCHEMES = XRAY_SCHEMES + SB_SCHEMES
+# эти форматы не проверяем, а сообщения с ними не удаляем
+UNSUPPORTED_SCHEMES = ("tuic://", "wireguard://", "wg://", "shadowtls://",
+                       "socks5://", "socks4://", "socks://")
 
 
-def parse(s):
-    if not s:
-        return None
+class Unsupported(ValueError):
+    """Формат не поддерживается: такой ключ не считаем мёртвым."""
+
+
+# ====================== логирование ======================
+def setup_logging() -> None:
+    """Только уровни DEBUG / INFO / WARNING. Уровень берётся из LOG_LEVEL."""
+    wanted = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    level = wanted if wanted in ("DEBUG", "INFO", "WARNING") else "INFO"
+
+    logging.Formatter.converter = time.gmtime  # время в UTC
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(name)-6s | %(message)s", "%Y-%m-%dT%H:%M:%SZ"))
+    root = logging.getLogger()
+    root.handlers[:] = [handler]
+    root.setLevel(level)
+    for noisy in ("telethon", "urllib3", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    if wanted != level:
+        log.warning("Неизвестный LOG_LEVEL=%r, использую INFO (доступно: DEBUG, INFO, WARNING)", wanted)
+    log.debug("логирование настроено, уровень %s", level)
+
+
+# ====================== результат проверки ======================
+@dataclass
+class CheckResult:
+    status: str                       # "ok" | "fail" | "skip"
+    error: Optional[str] = None
+    latency_ms: Optional[int] = None
+    attempts: int = 0
+    finished_at: Optional[datetime] = None
+
+
+def make_result(status: str, error: Optional[str] = None, latency_ms: Optional[int] = None,
+                attempts: int = 0) -> CheckResult:
+    return CheckResult(status, error, latency_ms, attempts, datetime.now(timezone.utc))
+
+
+def _short(text, n: int = 200) -> str:
+    return " ".join(str(text).split())[:n]
+
+
+def _classify(exc: Exception) -> str:
+    if isinstance(exc, requests.exceptions.Timeout):
+        kind = "timeout"
+    elif isinstance(exc, requests.exceptions.ProxyError):
+        kind = "proxy_error"
+    elif isinstance(exc, requests.exceptions.SSLError):
+        kind = "ssl_error"
+    elif isinstance(exc, requests.exceptions.ConnectionError):
+        kind = "connection_error"
+    else:
+        kind = type(exc).__name__
+    return f"{kind}: {_short(exc, 150)}"
+
+
+# ====================== общие помощники ======================
+def b64d(s: str) -> str:
+    s = s.strip().replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s).decode("utf-8", errors="ignore")
+
+
+def key_id(key: str) -> str:
+    # без #названия: тег меняется, а сам ключ тот же
+    return hashlib.sha1(key.split("#")[0].encode()).hexdigest()
+
+
+def label_of(key: str) -> str:
+    """Короткая подпись для логов: схема://host:port [id]. Без паролей и UUID."""
+    scheme = key.split("://", 1)[0]
+    host_port = "?"
     try:
-        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
+        body = key.split("://", 1)[1].split("#")[0]
+        if scheme == "vmess":
+            d = json.loads(b64d(body))
+            host_port = f"{d.get('add')}:{d.get('port')}"
+        elif scheme == "ss" and "@" not in body:
+            host_port = b64d(body.split("?")[0]).rsplit("@", 1)[1]
+        else:
+            u = urlparse(key.split("#")[0])
+            host_port = f"{u.hostname}:{u.port}"
+    except Exception:
+        pass
+    return f"{scheme}://{host_port} [{key_id(key)[:8]}]"
 
 
-def _defaults(label: str, now: datetime) -> dict:
+# ====================== Xray ======================
+def build_stream(net: str, sec: str, q: dict) -> dict:
+    net = {"h2": "http", "splithttp": "xhttp", "mkcp": "kcp", "raw": "tcp"}.get(net, net) or "tcp"
+    if net not in ("tcp", "ws", "grpc", "httpupgrade", "xhttp", "http", "kcp"):
+        raise Unsupported(f"транспорт {net}")
+    path = unquote(q.get("path", "/")) or "/"
+    host = q.get("host", "")
+    s = {"network": net}
+
+    if net == "ws":
+        s["wsSettings"] = {"path": path, "headers": {"Host": host} if host else {}}
+    elif net == "grpc":
+        s["grpcSettings"] = {"serviceName": unquote(q.get("serviceName", "")),
+                             "multiMode": q.get("mode") == "multi"}
+    elif net == "httpupgrade":
+        s["httpupgradeSettings"] = {"path": path, "host": host}
+    elif net == "xhttp":
+        x = {"path": path, "host": host, "mode": q.get("mode", "auto")}
+        if q.get("extra"):
+            try:
+                x["extra"] = json.loads(unquote(q["extra"]))
+            except ValueError:
+                log.debug("xhttp: параметр extra не JSON, пропускаю")
+        s["xhttpSettings"] = x
+    elif net == "http":
+        s["httpSettings"] = {"path": path, "host": [host] if host else []}
+    elif net == "kcp":
+        kcp = {"header": {"type": q.get("headerType") or "none"}}
+        if q.get("seed"):
+            kcp["seed"] = unquote(q["seed"])
+        s["kcpSettings"] = kcp
+    elif net == "tcp" and q.get("headerType") == "http":
+        s["tcpSettings"] = {"header": {"type": "http", "request": {
+            "path": [path], "headers": {"Host": [host] if host else []}}}}
+
+    sni = q.get("sni") or q.get("peer") or host
+    if sec == "tls":
+        s["security"] = "tls"
+        tls = {"serverName": sni,
+               "allowInsecure": q.get("allowInsecure", q.get("insecure", "0")) in ("1", "true")}
+        if q.get("fp"):
+            tls["fingerprint"] = q["fp"]
+        if q.get("alpn"):
+            tls["alpn"] = unquote(q["alpn"]).split(",")
+        s["tlsSettings"] = tls
+    elif sec == "reality":
+        s["security"] = "reality"
+        s["realitySettings"] = {
+            "serverName": sni,
+            "fingerprint": q.get("fp") or "chrome",
+            "publicKey": q.get("pbk", ""),
+            "shortId": q.get("sid", ""),
+            "spiderX": unquote(q.get("spx", "")),
+        }
+    return s
+
+
+def build_outbound(key: str) -> dict:
+    if key.startswith("vmess://"):
+        d = json.loads(b64d(key[8:].split("#")[0]))
+        net = d.get("net", "tcp")
+        q = {"path": d.get("path", "/"), "host": d.get("host", ""), "sni": d.get("sni", ""),
+             "fp": d.get("fp", ""), "alpn": d.get("alpn", ""), "headerType": d.get("type", ""),
+             "serviceName": d.get("path", ""), "seed": d.get("path", "") if net == "kcp" else ""}
+        sec = "tls" if d.get("tls") == "tls" else "none"
+        return {"protocol": "vmess",
+                "settings": {"vnext": [{"address": d["add"], "port": int(d["port"]), "users": [{
+                    "id": d["id"], "alterId": int(d.get("aid", 0) or 0),
+                    "security": d.get("scy", "auto")}]}]},
+                "streamSettings": build_stream(net, sec, q)}
+
+    if key.startswith("ss://"):
+        body = key[5:].split("#")[0]
+        if "?" in body:
+            raise Unsupported("ss plugin")
+        if "@" in body:
+            userinfo, hostport = body.rsplit("@", 1)
+            dec = b64d(userinfo) if ":" not in unquote(userinfo) else unquote(userinfo)
+            if ":" not in dec:
+                dec = unquote(userinfo)
+        else:
+            dec = b64d(body)
+            dec, hostport = dec.rsplit("@", 1)
+        method, password = dec.split(":", 1)
+        host, port = hostport.rsplit(":", 1)
+        return {"protocol": "shadowsocks",
+                "settings": {"servers": [{"address": host.strip("[]"), "port": int(port),
+                                          "method": method, "password": password}]}}
+
+    u = urlparse(key)
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    user = unquote(u.username or "")
+
+    if key.startswith("vless://"):
+        stream = build_stream(q.get("type", "tcp"), q.get("security", "none"), q)
+        return {"protocol": "vless",
+                "settings": {"vnext": [{"address": u.hostname, "port": u.port, "users": [{
+                    "id": user, "encryption": q.get("encryption", "none"),
+                    "flow": q.get("flow", "")}]}]},
+                "streamSettings": stream}
+
+    if key.startswith("trojan://"):
+        # у trojan без параметра security по умолчанию подразумевается tls
+        stream = build_stream(q.get("type", "tcp"), q.get("security", "tls"), q)
+        return {"protocol": "trojan",
+                "settings": {"servers": [{"address": u.hostname, "port": u.port, "password": user}]},
+                "streamSettings": stream}
+
+    raise Unsupported("схема")
+
+
+def build_xray_config(key: str, port: int) -> dict:
+    out = build_outbound(key)
+    out["tag"] = "proxy"
     return {
-        "label": label,
-        "added_at": None,             # 1. когда добавлен (дата сообщения в форуме)
-        "first_seen_at": iso(now),    # 1. когда скрипт впервые увидел
-        "last_seen_at": iso(now),     # служебное: когда последний раз встретился в форуме
-        "last_checked_at": None,      # 2. последняя проверка
-        "last_success_at": None,      # 3. последняя успешная
-        "last_fail_at": None,         # 4. последняя неуспешная
-        "consecutive_ok": 0,          # 5. успешных подряд
-        "total_ok": 0,                # 5.1 всего успешных
-        "total_checks": 0,            # 6. всего проверок
-        "consecutive_fail": 0,        # 7. неуспешных подряд
-        "total_fail": 0,              # 7.1 всего неуспешных
-        "last_error": None,           # 8. какая ошибка была
-        "backoff_sec": 0,             # 10. текущая задержка backoff
-        "next_check_at": iso(now),    # 9. когда проверять в следующий раз
+        "log": {"loglevel": "none"},
+        "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks",
+                      "settings": {"udp": False}}],
+        "outbounds": [out],
     }
 
 
-def describe(rec: dict) -> str:
-    return (f"ok_streak={rec['consecutive_ok']} ok_total={rec['total_ok']} "
-            f"fail_streak={rec['consecutive_fail']} fail_total={rec['total_fail']} "
-            f"checks={rec['total_checks']} backoff={rec['backoff_sec']}s next={rec['next_check_at']}")
+# ====================== sing-box ======================
+def split_uri(key: str):
+    body = key.split("://", 1)[1].split("#")[0]
+    main, _, query = body.partition("?")
+    userinfo, _, hostport = main.rstrip("/").rpartition("@")
+    q = {k: v[0] for k, v in parse_qs(query).items()}
+    if hostport.startswith("["):
+        host, _, rest = hostport[1:].partition("]")
+        port_s = rest.lstrip(":")
+    else:
+        host, _, port_s = hostport.partition(":")
+    if not host:
+        raise ValueError("нет host")
+    return unquote(userinfo), host, port_s, q
 
 
-def describe_full(rec: dict) -> str:
-    return (f"{describe(rec)} added={rec['added_at']} first_seen={rec['first_seen_at']} "
-            f"last_checked={rec['last_checked_at']} last_ok={rec['last_success_at']} "
-            f"last_fail={rec['last_fail_at']} last_error={rec['last_error']!r}")
+def parse_ports(port_s: str, q: dict):
+    tokens = [t for t in port_s.split(",") if t]
+    if q.get("mport"):
+        tokens += q["mport"].split(",")
+    single, ranges = None, []
+    for t in tokens:
+        if "-" in t:
+            a, b = t.split("-", 1)
+            ranges.append(f"{a}:{b}")
+        elif single is None:
+            single = int(t)
+    if single is None:
+        single = int(ranges[0].split(":")[0]) if ranges else 443
+    return single, ranges
 
 
-class State:
-    def __init__(self, path: str = STATE_FILE, dsn: str = DATABASE_URL):
-        self.path = path
-        self.dsn = dsn
-        self.keys: dict = {}
-        self.deleted: set = set()  # key_id, удалённые при очистке (для базы)
+def sb_tls(q: dict, host: str, alpn_default=None) -> dict:
+    insecure = (any(q.get(k) in ("1", "true") for k in ("insecure", "allowInsecure", "allow_insecure"))
+                or bool(q.get("pinSHA256")))  # pin обычно означает самоподписанный сертификат
+    tls = {"enabled": True, "server_name": q.get("sni") or q.get("peer") or host,
+           "insecure": insecure}
+    if q.get("alpn"):
+        tls["alpn"] = unquote(q["alpn"]).split(",")
+    elif alpn_default:
+        tls["alpn"] = alpn_default
+    return tls
 
-    # ---------- загрузка / сохранение ----------
-    def load(self) -> None:
-        if self.dsn:
-            import state_db  # импорт здесь, чтобы без базы не требовать psycopg2
-            log.info("хранилище состояния: база данных")
-            # при ошибке чтения исключение останавливает запуск: с нуля не начинаем,
-            # чтобы не затереть хорошее состояние пустым
-            self.keys = state_db.load_all(self.dsn)
-            return
 
-        log.info("хранилище состояния: файл %s", self.path)
-        log.debug("читаю состояние: %s", self.path)
+def build_singbox_config(key: str, port: int) -> dict:
+    scheme = key.split("://", 1)[0]
+    userinfo, host, port_s, q = split_uri(key)
+    sport, ranges = parse_ports(port_s, q)
+
+    if scheme in ("hysteria2", "hy2"):
+        ob = {"type": "hysteria2", "server": host, "server_port": sport,
+              "password": userinfo, "tls": sb_tls(q, host, ["h3"])}
+        if ranges:
+            ob["server_ports"] = ranges
+        if q.get("obfs") == "salamander":
+            ob["obfs"] = {"type": "salamander", "password": q.get("obfs-password", "")}
+    elif scheme == "hysteria":
+        if q.get("protocol", "udp") != "udp":
+            raise Unsupported("hysteria faketcp/wechat")
+
+        def mbps(name):
+            return int(re.sub(r"\D", "", q.get(name, "")) or 100)
+
+        ob = {"type": "hysteria", "server": host, "server_port": sport,
+              "up_mbps": mbps("upmbps"), "down_mbps": mbps("downmbps"),
+              "auth_str": q.get("auth", ""), "tls": sb_tls(q, host, ["h3"])}
+        if q.get("obfsParam"):
+            ob["obfs"] = q["obfsParam"]
+    elif scheme == "anytls":
+        ob = {"type": "anytls", "server": host, "server_port": sport,
+              "password": userinfo, "tls": sb_tls(q, host)}
+    else:
+        raise Unsupported(scheme)
+
+    ob["tag"] = "proxy"
+    return {"log": {"disabled": True},
+            "inbounds": [{"type": "socks", "listen": "127.0.0.1", "listen_port": port}],
+            "outbounds": [ob]}
+
+
+# ====================== окружение ======================
+def engine_versions() -> None:
+    for name, binary, arg in (("xray", XRAY_BIN, "version"), ("sing-box", SB_BIN, "version")):
         try:
-            with open(self.path, encoding="utf-8") as f:
-                data = json.load(f)
+            out = subprocess.run([binary, arg], capture_output=True, text=True, timeout=10)
+            first = (out.stdout or out.stderr).strip().splitlines()
+            log.info("движок %s: %s", name, first[0] if first else "версия не определена")
         except FileNotFoundError:
-            log.info("файл состояния не найден, начинаю с нуля: %s", self.path)
-            return
-        except (OSError, ValueError) as e:
-            log.warning("не удалось прочитать состояние (%s), начинаю с нуля", e)
-            return
-        self.keys = data.get("keys", {}) if isinstance(data, dict) else {}
-        saved = data.get("saved_at") if isinstance(data, dict) else None
-        log.info("состояние загружено: %d ключей, сохранено %s", len(self.keys), saved)
+            log.warning("движок %s не найден (%s): ключи этого типа проверяться не будут", name, binary)
+        except Exception as e:
+            log.warning("не удалось получить версию %s: %s", name, e)
 
-    def save(self) -> None:
-        if self.dsn:
-            import state_db
-            state_db.save_all(self.dsn, self.keys, self.deleted)
-            self.deleted.clear()
-            return
 
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"version": SCHEMA_VERSION, "saved_at": iso(utcnow()), "keys": self.keys},
-                      f, ensure_ascii=False, separators=(",", ":"))
-        os.replace(tmp, self.path)
-        log.info("состояние сохранено: %d ключей, %d байт", len(self.keys), os.path.getsize(self.path))
+def preflight() -> bool:
+    """Проверка прямого интернета на раннере, без прокси."""
+    try:
+        r = requests.get(TEST_URL, timeout=TIMEOUT)
+        log.info("preflight: прямой доступ к %s: http %d", TEST_URL, r.status_code)
+        return r.status_code in (200, 204)
+    except requests.RequestException as e:
+        log.warning("preflight: прямой доступ к %s недоступен: %s", TEST_URL, _classify(e))
+        return False
 
-    def prune(self, now: datetime) -> int:
-        if STATE_TTL_DAYS <= 0:
-            log.debug("очистка состояния отключена (STATE_TTL_DAYS=0)")
-            return 0
-        limit = now - timedelta(days=STATE_TTL_DAYS)
-        old = []
-        for kid, rec in self.keys.items():
-            seen = parse(rec.get("last_seen_at")) or parse(rec.get("first_seen_at"))
-            if seen is None or seen < limit:
-                old.append(kid)
-        for kid in old:
-            log.debug("удаляю из состояния давно не встречавшийся ключ %s [%s]",
-                      self.keys[kid].get("label"), kid[:8])
-            del self.keys[kid]
-            self.deleted.add(kid)
-        log.info("очистка состояния: удалено %d записей старше %s дн.", len(old), STATE_TTL_DAYS)
-        return len(old)
 
-    # ---------- доступ ----------
-    def get(self, kid: str) -> dict:
-        return self.keys[kid]
+# ====================== проверка ключа ======================
+def wait_port(port: int, proc: subprocess.Popen, timeout: float) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if proc.poll() is not None:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
 
-    def touch(self, kid: str, label: str, added_at, now: datetime) -> dict:
-        rec = self.keys.get(kid)
-        if rec is None:
-            rec = _defaults(label, now)
-            self.keys[kid] = rec
-            self.deleted.discard(kid)
-            log.debug("новый ключ %s", label)
+
+def _tail(f, n: int = 300) -> str:
+    try:
+        f.flush()
+        f.seek(0)
+        data = f.read()[-n:].decode("utf-8", errors="replace")
+        return " | ".join(l.strip() for l in data.splitlines() if l.strip())
+    except Exception:
+        return ""
+
+
+def check_key(key: str, port: int) -> CheckResult:
+    lb = label_of(key)
+    try:
+        if key.startswith(SB_SCHEMES):
+            engine, cfg = "sing-box", build_singbox_config(key, port)
+            cmd, startup = [SB_BIN, "run", "-c"], 8.0
         else:
-            for k, v in _defaults(label, now).items():  # дополняем записи старой схемы
-                rec.setdefault(k, v)
-            rec["label"] = label
-            rec["last_seen_at"] = iso(now)
-        if added_at is not None:
-            current = parse(rec["added_at"])
-            if current is None or added_at < current:
-                rec["added_at"] = iso(added_at)
-        return rec
+            engine, cfg = "xray", build_xray_config(key, port)
+            cmd, startup = [XRAY_BIN, "run", "-c"], 4.0
+    except Unsupported as e:
+        log.debug("%s: формат не поддерживается: %s", lb, e)
+        return make_result("skip", f"unsupported: {_short(e, 100)}")
+    except Exception as e:
+        err = f"parse_error: {type(e).__name__}: {_short(e, 150)}"
+        log.debug("%s: не удалось собрать конфиг: %s", lb, err)
+        return make_result("fail", err)
 
-    def is_due(self, rec: dict, now: datetime) -> bool:
-        nxt = parse(rec.get("next_check_at"))
-        return nxt is None or nxt <= now
+    log.debug("%s: конфиг собран, движок=%s, порт=%d", lb, engine, port)
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f)
+    out = tempfile.TemporaryFile()
+    started = time.time()
+    proc = subprocess.Popen(cmd + [path], stdout=out, stderr=subprocess.STDOUT)
+    log.debug("%s: процесс %s запущен, pid=%d", lb, engine, proc.pid)
 
-    def is_dead(self, rec: dict) -> bool:
-        return rec["consecutive_fail"] >= DELETE_AFTER_FAILS
+    try:
+        if not wait_port(port, proc, startup):
+            code = proc.poll()
+            if code is not None:
+                err = f"engine_exited code={code}: {_short(_tail(out), 200)}"
+            else:
+                err = f"engine_start_timeout after {startup:.0f}s"
+            log.debug("%s: движок не поднялся: %s", lb, err)
+            return make_result("fail", err)
+        log.debug("%s: %s слушает порт %d, поднялся за %.1fs", lb, engine, port, time.time() - started)
 
-    # ---------- запись результатов ----------
-    def record_ok(self, kid: str, at: datetime, latency_ms) -> dict:
-        rec = self.keys[kid]
-        rec["last_checked_at"] = iso(at)
-        rec["last_success_at"] = iso(at)
-        rec["total_checks"] += 1
-        rec["total_ok"] += 1
-        rec["consecutive_ok"] += 1
-        rec["consecutive_fail"] = 0
-        rec["backoff_sec"] = 0
-        rec["next_check_at"] = iso(at + timedelta(seconds=OK_INTERVAL_SEC))
-        log.debug("%s: успех записан, серия успехов %d, backoff сброшен, следующая проверка %s",
-                  rec["label"], rec["consecutive_ok"], rec["next_check_at"])
-        return rec
-
-    def record_fail(self, kid: str, at: datetime, error) -> dict:
-        rec = self.keys[kid]
-        prev = rec["backoff_sec"]
-        new = BACKOFF_BASE_SEC if prev <= 0 else min(int(prev * BACKOFF_FACTOR), BACKOFF_MAX_SEC)
-        rec["last_checked_at"] = iso(at)
-        rec["last_fail_at"] = iso(at)
-        rec["total_checks"] += 1
-        rec["total_fail"] += 1
-        rec["consecutive_fail"] += 1
-        rec["consecutive_ok"] = 0
-        rec["last_error"] = error
-        rec["backoff_sec"] = new
-        rec["next_check_at"] = iso(at + timedelta(seconds=new))
-        log.debug("%s: неудача записана, серия неудач %d, backoff %ds -> %ds, следующая проверка %s",
-                  rec["label"], rec["consecutive_fail"], prev, new, rec["next_check_at"])
-        return rec
-
-    def record_skip(self, kid: str, at: datetime, error) -> dict:
-        """Формат не поддерживается: счётчики проверок не трогаем, ключ не считается мёртвым."""
-        rec = self.keys[kid]
-        rec["last_error"] = error
-        rec["next_check_at"] = iso(at + timedelta(seconds=SKIP_RECHECK_SEC))
-        log.debug("%s: пропуск записан (%s), следующая попытка %s",
-                  rec["label"], error, rec["next_check_at"])
-        return rec
+        last_err = None
+        for attempt in (1, 2):  # 2 попытки, чтобы случайный таймаут не убил рабочий ключ
+            t1 = time.time()
+            try:
+                r = requests.get(TEST_URL, proxies={"http": f"socks5h://127.0.0.1:{port}",
+                                                    "https": f"socks5h://127.0.0.1:{port}"},
+                                 timeout=TIMEOUT, allow_redirects=False)
+                ms = int((time.time() - t1) * 1000)
+                if r.status_code in (200, 204):
+                    log.debug("%s: попытка %d/2 успех, http %d, %d мс", lb, attempt, r.status_code, ms)
+                    return make_result("ok", None, latency_ms=ms, attempts=attempt)
+                last_err = f"http_{r.status_code}"
+                log.debug("%s: попытка %d/2 неверный ответ: %s (%d мс)", lb, attempt, last_err, ms)
+            except requests.RequestException as e:
+                last_err = _classify(e)
+                log.debug("%s: попытка %d/2 ошибка: %s", lb, attempt, last_err)
+        return make_result("fail", last_err, attempts=2)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+            log.debug("%s: процесс остановлен", lb)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            log.debug("%s: процесс не остановился, убит принудительно", lb)
+        out.close()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
